@@ -1,4 +1,4 @@
-# video-cut 視頻剪輯系統工具
+# video-cut 視頻剪輯系統工具 https://achir1015.github.io/video-cut/
 
 讓我先讀取參考 ZIP 檔案，然後建構這個工具。
 
