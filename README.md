@@ -1,4 +1,6 @@
 # video-cut 視頻剪輯系統工具 https://achir1015.github.io/video-cut/
+<img width="1918" height="727" alt="image" src="https://github.com/user-attachments/assets/7ee9120f-33be-489b-8aeb-25737a2dad19" />
+
 
 讓我先讀取參考 ZIP 檔案，然後建構這個工具。
 
