@@ -246,6 +246,7 @@ html,body{height:100%;overflow:hidden;background:#111122;color:#dde;font-family:
     <button class="tl-btn" onclick="jumpToPlayhead()" title="跳至播放頭位置">⊙ 定位</button>
     <div class="tl-sep"></div>
     <button class="tl-btn" onclick="addTextClip()">T+ 文字</button>
+    <span id="frame-display" style="font-size:11px;color:#7af;background:#0a0a1a;border:1px solid #2a2a44;border-radius:3px;padding:2px 7px;margin-left:4px;font-family:monospace;">F 0</span>
   </div>
   <div id="tl-body" style="position:relative;">
     <div id="track-headers"></div>
@@ -795,6 +796,7 @@ function updatePlayhead() {
 
 function updateTimeDis() {
   document.getElementById('time-display').textContent=`${fmt(S.t)} / ${fmt(S.dur)}`;
+  document.getElementById('frame-display').textContent=`F ${Math.floor(S.t*fps)+1}`;
 }
 
 // ── PLAYBACK ──────────────────────────────────────────────────────
@@ -973,9 +975,35 @@ function drawFrame() {
           ctx.shadowOffsetX=(clip.shx??3)*sc2;
           ctx.shadowOffsetY=(clip.shy??3)*sc2;
         }
-        if(clip.sw) ctx.strokeText(clip.text||'',tx,ty);
-        ctx.fillText(clip.text||'',tx,ty);
+        const lines=(clip.text||'').split('\n');
+        const lh=(clip.fs||60)*sc2*1.25;
+        lines.forEach((ln,i)=>{
+          if(clip.sw) ctx.strokeText(ln,tx,ty+i*lh);
+          ctx.fillText(ln,tx,ty+i*lh);
+        });
         ctx.restore();
+        // Draw selection outline + 4-corner resize handles when this clip is selected
+        if(clip.id===S.selClip){
+          const maxLen=Math.max(...lines.map(l=>l.length),1);
+          const bw=fs*maxLen*0.6*sc2, bh=(lines.length-1)*lh+fs*sc2;
+          const bx=tx-6, by=ty-fs*sc2-6, bw2=bw+12, bh2=bh+12;
+          ctx.save();
+          ctx.strokeStyle='#00cfff'; ctx.lineWidth=5; ctx.setLineDash([14,8]);
+          ctx.strokeRect(bx, by, bw2, bh2);
+          ctx.setLineDash([]);
+          // 4 corner handles
+          const hr=16;
+          [[bx,by],[bx+bw2,by],[bx,by+bh2],[bx+bw2,by+bh2]].forEach(([hx,hy])=>{
+            ctx.fillStyle='#ffffff';
+            ctx.strokeStyle='#00cfff';
+            ctx.lineWidth=4;
+            ctx.beginPath();
+            ctx.arc(hx,hy,hr,0,Math.PI*2);
+            ctx.fill();
+            ctx.stroke();
+          });
+          ctx.restore();
+        }
       }
     });
   });
@@ -1013,6 +1041,37 @@ function stopAudio() {
   audioSources=[];
 }
 
+// After project load: keep redrawing via rAF until all video elements have decoded their first frame
+function refreshVideoPreview() {
+  S.t = 1/30; updatePlayhead(); updateTimeDis();
+
+  // Collect video elements and seek them
+  const vidClips = [];
+  S.tracks.filter(tr=>tr.type==='video'&&tr.enabled!==false).forEach(track=>{
+    track.clips.forEach(clip=>{
+      const vid = S.mediaEls[clip.mediaId];
+      if(!vid||vid.tagName!=='VIDEO') return;
+      vid.preload='auto';
+      const ct = Math.max(0, (1/30 - clip.ts) + (clip.cs||0));
+      vid.currentTime = ct;
+      vidClips.push(vid);
+    });
+  });
+
+  drawFrame(); // draw text immediately
+  if(!vidClips.length) return;
+
+  // Poll via rAF until all videos are ready (readyState >= 2 = HAVE_CURRENT_DATA)
+  let ticks = 0;
+  const poll = ()=>{
+    drawFrame();
+    ticks++;
+    const allReady = vidClips.every(v => v.readyState >= 2);
+    if(!allReady && ticks < 150) requestAnimationFrame(poll); // up to ~5s
+  };
+  requestAnimationFrame(poll);
+}
+
 // Mute video elements whose track is disabled or trackMuted; unmute all others
 function updateVideoAudio() {
   const v = S.volume ?? 1;
@@ -1032,6 +1091,7 @@ function updateVideoAudio() {
 function selectClip(cid, tid) {
   S.selClip=cid; S.selTrack=tid;
   renderRows();
+  drawFrame();
   if(!cid){
     document.getElementById('props-body').innerHTML='<div class="props-empty">選取片段以編輯屬性</div>';
     return;
@@ -1221,7 +1281,7 @@ function fontOpts(cur){
 function addTextClip(forceTid) {
   openModal('新增文字',`
     <div class="m-label">文字內容</div>
-    <input class="m-input" id="m-txt" placeholder="輸入文字..." value="文字標題">
+    <textarea class="m-input" id="m-txt" rows="4" placeholder="輸入文字（可換行）..." style="resize:vertical;">文字標題</textarea>
     <div class="m-label">字型</div>
     <select class="m-input" id="m-ff" style="font-size:12px;">${fontOpts('Arial')}</select>
     <div class="m-row">
@@ -1253,7 +1313,7 @@ function addTextClip(forceTid) {
 function editTextClip(clip) {
   openModal('編輯文字',`
     <div class="m-label">文字內容</div>
-    <input class="m-input" id="m-txt" value="${esc(clip.text||'')}">
+    <textarea class="m-input" id="m-txt" rows="4" style="resize:vertical;">${esc(clip.text||'')}</textarea>
     <div class="m-label">字型</div>
     <select class="m-input" id="m-ff" style="font-size:12px;">${fontOpts(clip.ff||'Arial')}</select>
     <div class="m-row">
@@ -1271,12 +1331,33 @@ function editTextClip(clip) {
 
 // ── TEXT DRAG IN PREVIEW ──────────────────────────────────────────
 let txtDrag=null, txtOff={x:0,y:0};
+let txtResize=null; // {clip, startX, startFs}
 
 cvs.addEventListener('mousedown',e=>{
   const r=cvs.getBoundingClientRect();
   const sx=1280/r.width, sy=720/r.height;
   const mx=(e.clientX-r.left)*sx, my=(e.clientY-r.top)*sy;
   const t=S.t;
+
+  // Check resize handles on selected text clip first (4 corners)
+  if(S.selClip){
+    const selClip=S.tracks.flatMap(tr=>tr.clips).find(c=>c.id===S.selClip);
+    if(selClip&&!selClip.mediaId&&t>=selClip.ts&&t<selClip.ts+selClip.dur){
+      const lines=(selClip.text||'').split('\n');
+      const fs=selClip.fs||60;
+      const maxLen=Math.max(...lines.map(l=>l.length),1);
+      const tx2=selClip.x||640, ty2=selClip.y||600;
+      const bw=fs*maxLen*0.6, bh=(lines.length-1)*fs*1.25+fs;
+      const bx=tx2-6, by=ty2-fs-6, bw2=bw+12, bh2=bh+12;
+      const corners=[[bx,by],[bx+bw2,by],[bx,by+bh2],[bx+bw2,by+bh2]];
+      for(const [hx,hy] of corners){
+        if(Math.abs(mx-hx)<18&&Math.abs(my-hy)<18){
+          txtResize={clip:selClip,startX:mx,startY:my,startFs:fs,cx:tx2+bw/2,cy:ty2-fs/2+bh/2};
+          e.preventDefault(); return;
+        }
+      }
+    }
+  }
 
   for(const track of S.tracks.filter(tr=>tr.type==='text')){
     for(const clip of track.clips){
@@ -1301,9 +1382,17 @@ cvs.addEventListener('mousedown',e=>{
 });
 
 document.addEventListener('mousemove',e=>{
-  if(!txtDrag) return;
   const r=cvs.getBoundingClientRect();
   const sx=1280/r.width, sy=720/r.height;
+  if(txtResize){
+    const mx2=(e.clientX-r.left)*sx, my2=(e.clientY-r.top)*sy;
+    const dx=mx2-txtResize.startX, dy=my2-txtResize.startY;
+    const delta=(Math.abs(dx)>Math.abs(dy)?dx:dy);
+    txtResize.clip.fs=Math.max(8,Math.round(txtResize.startFs+delta*0.4));
+    drawFrame();
+    return;
+  }
+  if(!txtDrag) return;
   txtDrag.x=(e.clientX-r.left)*sx-txtOff.x;
   txtDrag.y=(e.clientY-r.top)*sy-txtOff.y;
   drawFrame();
@@ -1314,6 +1403,7 @@ document.addEventListener('mousemove',e=>{
 });
 
 document.addEventListener('mouseup',()=>{
+  if(txtResize){saveHistory();txtResize=null;}
   if(txtDrag){saveHistory();txtDrag=null;}
 });
 
@@ -1341,14 +1431,28 @@ function scrubX(cx) {
 function dragClip(e,clip,track) {
   e.preventDefault();
   const sx=e.clientX, ots=clip.ts;
+  let destTrack=track;
   const mm=e=>{
     clip.ts=Math.max(0,ots+(e.clientX-sx)/S.scale);
+    // Detect which row the cursor is over
+    const el=document.elementFromPoint(e.clientX,e.clientY);
+    const row=el?.closest('.trk-row');
+    if(row&&row.dataset.tid){
+      const t=S.tracks.find(t=>t.id===row.dataset.tid);
+      // Only allow same-type tracks
+      if(t&&t.type===track.type) destTrack=t;
+      else destTrack=track;
+    }
     renderRows();
   };
   const mu=()=>{
     document.removeEventListener('mousemove',mm);
     document.removeEventListener('mouseup',mu);
-    saveHistory();
+    if(destTrack!==track){
+      track.clips=track.clips.filter(c=>c.id!==clip.id);
+      destTrack.clips.push(clip);
+    }
+    saveHistory(); renderAll();
   };
   document.addEventListener('mousemove',mm);
   document.addEventListener('mouseup',mu);
@@ -1635,12 +1739,16 @@ async function processProjectFile(file) {
         }
       }
       renderLib(); renderAll(); drawFrame();
+      // 視頻元素建立完成後才 seek 預覽第一幀
+      refreshVideoPreview();
       if (stillMissing.length > 0) {
         showRelinkDialog(stillMissing);
       } else {
         toast('✅ 專案「' + (proj.name||'未命名') + '」已載入');
       }
     } else {
+      // 內嵌視頻（b64）也在此 seek 預覽
+      refreshVideoPreview();
       toast('✅ 專案「' + (proj.name||'未命名') + '」已載入');
     }
   } catch(err) {
@@ -1923,8 +2031,12 @@ async function doExport(){
               ectx.shadowOffsetY=(clip.shy??3)*sc2e;
             }
             const tx=(clip.x||EW/2)*sx, ty=(clip.y||EH*0.8)*sy;
-            if(clip.sw) ectx.strokeText(clip.text||'',tx,ty);
-            ectx.fillText(clip.text||'',tx,ty);
+            const lines=(clip.text||'').split('\n');
+            const lh=(clip.fs||60)*sc2e*1.25;
+            lines.forEach((ln,i)=>{
+              if(clip.sw) ectx.strokeText(ln,tx,ty+i*lh);
+              ectx.fillText(ln,tx,ty+i*lh);
+            });
             ectx.restore();
           }
         }
@@ -2030,8 +2142,9 @@ document.addEventListener('drop', e => {
   }
 });
 
-// 離開頁面前警告，防止 F5/關閉/返回 意外清空專案
-window.addEventListener('beforeunload', e => { e.preventDefault(); e.returnValue=''; });
+// 靜默捕捉所有未處理的 JS 錯誤與 Promise 拒絕，避免瀏覽器彈出重新載入對話框
+window.addEventListener('error', e => { e.preventDefault(); console.warn('[IPMOS]', e.message); });
+window.addEventListener('unhandledrejection', e => { e.preventDefault(); console.warn('[IPMOS]', e.reason); });
 </script>
 </body>
 </html>
